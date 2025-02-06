@@ -1,0 +1,216 @@
+---
+- name: Install K3s on Jetson Orin Nano
+  hosts: all
+  gather_facts: true
+  vars:
+    jetson_orin_nano_k3s_swap_size_gb: 8
+    jetson_orin_nano_k3s_disable_ipv6: true
+    jetson_orin_nano_k3s_k9s_version: v0.32.7
+    jetson_orin_nano_k3s_force_reinstall: false
+    jetson_orin_nano_k3s_kube_api_url: "https://horcrux.poehls.local:6443"
+  tasks:
+    - name: Add non-standard packages
+      ansible.builtin.package:
+        name: '{{ package.name }}'
+        state: '{{ package.state }}'
+        use: auto
+      loop:
+        - name: vim
+          state: present
+        - name: openssh-server
+          state: present
+        - name: curl
+          state: present
+      loop_control:
+        label: 'Installing package - {{ package.name }}'
+        loop_var: package
+      become: true
+
+    - name: Setup passwordless sudo
+      community.general.sudoers:
+        name: '10-{{ ansible_user_id }}'
+        commands: ALL
+        nopassword: true
+        sudoers_path: /etc/sudoers.d
+        state: present
+        user: '{{ ansible_user_id }}'
+        validation: required
+      become: true
+
+    - name: SSH hardening
+      ansible.builtin.copy:
+        mode: u=rw,g=r,o=r
+        owner: root
+        group: root
+        dest: '{{ sshd_file.dest }}'
+        validate: /usr/sbin/sshd -T -f %s
+        src: '{{ sshd_file.src }}'
+      loop:
+        - src: etc/ssh/sshd_config.d/01-customizations.conf
+          dest: /etc/ssh/sshd_config.d/01-customizations.conf
+      loop_control:
+        label: 'Copy SSH hardening file - {{ sshd_file.src }}'
+        loop_var: sshd_file
+      become: true
+      notify: Restart sshd
+
+    - name: Check CPU count
+      ansible.builtin.set_fact:
+        _k3s_swap_size: "{{ jetson_orin_nano_k3s_swap_size_gb * 1024 / ansible_processor_vcpus * 1024 * 1024 }}"
+
+    - name: Update swap (zram)
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/nvzramconfig.sh
+        state: present
+        mode: u=rwx,g=xr,o=x
+        owner: root
+        group: root
+        regexp: '^mem='
+        line: 'mem={{ _k3s_swap_size | int }}'
+        backup: true
+      become: true
+      notify: Reboot for updates
+
+    - name: Disable IPv6 Kernel Parameters
+      ansible.posix.sysctl:
+        name: "{{ item }}"
+        value: 0
+        state: present
+        sysctl_set: true
+        reload: true
+      loop:
+        - net.ipv6.conf.all.disable_ipv6
+        - net.ipv6.conf.default.disable_ipv6
+        - net.ipv6.conf.lo.disable_ipv6
+      become: true
+      notify: Reboot for updates
+
+    - name: Copy docker daemon config
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        mode: u=rw,g=r,o=r
+        owner: root
+        group: root
+        src: files/etc/docker/daemon.json
+        backup: true
+      become: true
+
+    - name: Download current K3S install script
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: "{{ ansible_user_dir }}/install-k3s.sh"
+        mode: u=rwx,g=xr,o=x
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_id }}"
+        backup: true
+
+    - name: Download k9s binary
+      ansible.builtin.get_url:
+        url: "https://github.com/derailed/k9s/releases/download/{{ jetson_orin_nano_k3s_k9s_version }}/k9s_linux_arm64.deb"
+        dest: /tmp/k9s_linux_arm64.deb
+        mode: u=rw,g=r,o=r
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_id }}"
+
+    - name: Install k9s binary
+      ansible.builtin.apt:
+        deb: "/tmp/k9s_linux_arm64.deb"
+        state: present
+      become: true
+
+    # - name: Add user to docker group
+    #   ansible.builtin.user:
+    #     name: "{{ ansible_user_id }}"
+    #     groups: docker
+    #     append: true
+    #   become: true
+
+    # - name: Ensure docker socket is enabled
+    #   ansible.builtin.systemd:
+    #     name: docker.socket
+    #     enabled: true
+    #     state: started
+    #   become: true
+
+    # - name: Ensure docker service is running
+    #   ansible.builtin.systemd:
+    #     name: docker.service
+    #     enabled: true
+    #     state: started
+    #   become: true
+
+    - name: Gather services info
+      ansible.builtin.service_facts:
+
+    - name: Copy k3s configuration file
+      ansible.builtin.template:
+        src: etc/rancher/k3s/config.yml.j2
+        dest: "{{ ansible_user_dir }}/k3s-config.yml"
+        mode: u=rw,g=r,o=r
+        backup: true
+        owner: '{{ ansible_user_id }}'
+        group: '{{ ansible_user_id }}'
+
+    # - name: Execute K3s install script
+    #   ansible.builtin.shell: |
+    #     sh -c {{ ansible_user_dir }}/install-k3s.sh \
+    #       --config-file {{ ansible_user_dir }}/k3s-config.yml
+    #   when: '"k3s.service" not in (ansible_facts.services | list) or jetson_orin_nano_k3s_force_reinstall'
+    #   become: true
+    - name: Execute K3s install script
+      ansible.builtin.shell: |
+        sh -c {{ ansible_user_dir }}/install-k3s.sh \
+          --flannel-backend none \
+          --flannel-ipv4-masq false \
+          --disable-kube-proxy true \
+          --disable-network-policy true \
+          --server https://{{ jetson_orin_nano_k3s_kube_api_url[:-5] }}:6443 \
+          --write-kubeconfig-mode 644 \
+          --write-kubeconfig {{ ansible_user_dir }}/.kube/config \
+          --cluster-init true \
+          --disable servicelb \
+          --disable traefik
+      when: '"k3s.service" not in (ansible_facts.services | list) or jetson_orin_nano_k3s_force_reinstall'
+      become: true
+
+    - name: Copy kubeconfig to user home
+      ansible.builtin.copy:
+        dest: "{{ ansible_user_dir }}/.kube/config"
+        mode: u=rw,g=r,o=r
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_id }}"
+        remote_src: true
+        src: /etc/rancher/k3s/k3s.yaml
+        backup: true
+      become: true
+
+    - name: Copy kubeconfig to control machine
+      ansible.builtin.fetch:
+        src: "{{ ansible_user_dir }}/.kube/config"
+        dest: "{{ playbook_dir }}/kube_config"
+        flat: true
+
+    - name: Doctor kube config server URL on control machine
+      ansible.builtin.lineinfile:
+        path: "{{ playbook_dir }}/kube_config"
+        regexp: '^\s+server\:\shttps\:\/\/127'
+        line: '    server: {{ jetson_orin_nano_k3s_kube_api_url }}'
+      delegate_to: localhost
+
+    - name: Doctor kube config insecure on control machine
+      ansible.builtin.lineinfile:
+        path: "{{ playbook_dir }}/kube_config"
+        regexp: '^\s+certificate\-authority\-data'
+        line: '    insecure-skip-tls-verify: true'
+      delegate_to: localhost
+
+  handlers:
+    - name: Restart sshd
+      ansible.builtin.systemd:
+        name: sshd
+        state: restarted
+      become: true
+
+    - name: Reboot for updates
+      ansible.builtin.reboot:
+      become: true

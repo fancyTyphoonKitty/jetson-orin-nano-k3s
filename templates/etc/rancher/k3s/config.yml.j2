@@ -1,0 +1,13 @@
+---
+flannel-backend: none
+flannel-ipv4-masq: false
+disable-kube-proxy: true
+disable-network-policy: true
+server: https://{{ jetson_orin_nano_k3s_kube_api_url[:-5] }}:6443
+write-kubeconfig-mode: 644
+write-kubeconfig: '{{ ansible_user_dir }}/.kube/config'
+cluster-init: true
+disable:
+  - servicelb
+  - traefik
+  
